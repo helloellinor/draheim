@@ -304,14 +304,23 @@ func LoadConfig() *Config {
 		}
 	}
 	
-	// Create default config
+	// Create default config with persistent storage
+	draheimDir := filepath.Join(os.Getenv("HOME"), ".draheim")
 	config := &Config{
 		ServerPort:     ":8080",
-		RepoBasePath:   "/tmp/draheim-repos",
+		RepoBasePath:   filepath.Join(draheimDir, "projects"),
 		AllowedHosts:   []string{"github.com", "gitlab.com", "bitbucket.org"},
 		SSHKeyPath:     filepath.Join(os.Getenv("HOME"), ".ssh/id_rsa"),
 		DefaultBranch:  "main",
-		SecretsKeyPath: "draheim-secrets.key",
+		SecretsKeyPath: filepath.Join(draheimDir, "secrets.key"),
+	}
+	
+	// Ensure the .draheim directory exists
+	if err := os.MkdirAll(draheimDir, 0755); err != nil {
+		log.Printf("Warning: Could not create .draheim directory: %v", err)
+	}
+	if err := os.MkdirAll(config.RepoBasePath, 0755); err != nil {
+		log.Printf("Warning: Could not create projects directory: %v", err)
 	}
 	
 	// Save default config
@@ -566,6 +575,10 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
         input, select { padding: 8px; margin: 5px; border: 1px solid #ddd; border-radius: 4px; }
         .logs { background: #2c3e50; color: #ecf0f1; padding: 10px; border-radius: 4px; font-family: monospace; max-height: 300px; overflow-y: scroll; margin: 10px 0; }
         .refresh-info { color: #7f8c8d; font-size: 0.9em; margin: 10px 0; }
+        .help-section { background: #d5dbdb; padding: 15px; border-radius: 4px; margin: 10px 0; border-left: 4px solid #3498db; }
+        .help-title { font-weight: bold; color: #2c3e50; margin-bottom: 10px; font-size: 1.1em; }
+        .help-text { color: #7f8c8d; font-size: 0.9em; margin-top: 5px; display: block; }
+        .cmd { background: #34495e; color: #ecf0f1; padding: 2px 6px; border-radius: 3px; font-family: monospace; font-size: 0.9em; }
     </style>
 </head>
 <body>
@@ -577,12 +590,23 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
         </div>
 
         <div class="card">
-            <h2>Deploy New Application</h2>
+            <h2>🚀 Deploy New Application</h2>
+            <div class="help-section">
+                <div class="help-title">💡 How Deployment Works</div>
+                <p><strong>For Hackers:</strong> Draheim creates isolated tmux sessions for each application. You can interact directly with any app using <span class="cmd">tmux attach -t PROJECT_NAME</span></p>
+                <p><strong>Storage:</strong> Projects are stored in <span class="cmd">~/.draheim/projects/</span> for persistence across reboots.</p>
+                <p><strong>Two deployment methods:</strong></p>
+                <ul>
+                    <li><strong>Binary:</strong> Deploy an existing Go binary directly</li>
+                    <li><strong>Git:</strong> Clone repository, run <span class="cmd">go build</span>, then deploy</li>
+                </ul>
+            </div>
             <div class="deploy-form">
                 <form action="/deploy" method="post">
                     <div class="form-group">
                         <label>Project Name:</label>
                         <input type="text" name="name" required placeholder="my-app">
+                        <small class="help-text">🔧 Creates tmux session with this name</small>
                     </div>
                     <div class="form-group">
                         <label>Binary Path (or leave empty for Git deployment):</label>
@@ -593,18 +617,22 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
                             <option value="/usr/local/bin/">
                             <option value="./bin/">
                         </datalist>
+                        <small class="help-text">🔧 If specified, runs this binary directly in tmux</small>
                     </div>
                     <div class="form-group">
                         <label>Git Repository URL (optional):</label>
                         <input type="url" name="git_repo" placeholder="https://github.com/user/repo.git">
+                        <small class="help-text">🔧 If specified, clones to ~/.draheim/projects/, runs 'go build', then deploys</small>
                     </div>
                     <div class="form-group">
                         <label>Git Branch (default: main):</label>
                         <input type="text" name="git_branch" placeholder="main" value="main">
+                        <small class="help-text">🔧 Branch to checkout after cloning</small>
                     </div>
                     <div class="form-group">
                         <label>Port:</label>
                         <input type="number" name="port" required placeholder="8081">
+                        <small class="help-text">🔧 Port your Go application listens on (ensure it's not in use)</small>
                     </div>
                     <button type="submit" class="btn btn-success">Deploy Application</button>
                 </form>
@@ -612,7 +640,14 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
         </div>
 
         <div class="card">
-            <h2>Active Projects</h2>
+            <h2>🖥️ Active Projects</h2>
+            <div class="help-section">
+                <div class="help-title">💡 Project Management</div>
+                <p><strong>Status:</strong> Shows real-time tmux session status</p>
+                <p><strong>Logs:</strong> Live view of stdout/stderr from your application</p>
+                <p><strong>Stop:</strong> Terminates the tmux session (can be restarted)</p>
+                <p><strong>Manual Control:</strong> Use <span class="cmd">tmux list-sessions</span> to see all active sessions</p>
+            </div>
             <div id="projects-list" hx-get="/projects" hx-trigger="every 5s">
                 {{template "projects" .}}
             </div>
@@ -853,11 +888,32 @@ func logsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get tmux session output
-	cmd := exec.Command("tmux", "capture-pane", "-t", projectName, "-p")
-	output, err := cmd.Output()
-	if err != nil {
-		output = []byte(fmt.Sprintf("Error getting logs: %v", err))
+	// Check if tmux session exists first
+	checkCmd := exec.Command("tmux", "has-session", "-t", projectName)
+	var output []byte
+	var sessionStatus string
+	var debugInfo string
+	
+	if err := checkCmd.Run(); err != nil {
+		sessionStatus = "❌ Not Running"
+		debugInfo = fmt.Sprintf("Behind the scenes: Tmux session '%s' not found. The application may have crashed or been stopped manually.", projectName)
+		output = []byte(fmt.Sprintf("Session '%s' is not running.\n\nPossible reasons:\n• Application crashed\n• Session was manually terminated\n• Application failed to start\n\nTry redeploying the application from the dashboard.", projectName))
+	} else {
+		sessionStatus = "✅ Running"
+		debugInfo = fmt.Sprintf("Behind the scenes: Reading logs from tmux session '%s' using 'tmux capture-pane -t %s -p'", projectName, projectName)
+		
+		// Get tmux session output
+		cmd := exec.Command("tmux", "capture-pane", "-t", projectName, "-p")
+		var err error
+		output, err = cmd.Output()
+		if err != nil {
+			output = []byte(fmt.Sprintf("Error getting logs from tmux session: %v\n\nThis usually means the session exists but can't be read. Try stopping and restarting the application.", err))
+		}
+		
+		// If output is empty, provide helpful message
+		if len(strings.TrimSpace(string(output))) == 0 {
+			output = []byte("No output captured yet. The application may be starting up or may not produce console output.\n\nBehind the scenes: Tmux session exists but no output has been captured to the terminal buffer.")
+		}
 	}
 
 	tmpl := `
@@ -870,31 +926,62 @@ func logsHandler(w http.ResponseWriter, r *http.Request) {
         body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
         .container { max-width: 1200px; margin: 0 auto; }
         .header { background: #2c3e50; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
-        .logs { background: #2c3e50; color: #ecf0f1; padding: 20px; border-radius: 4px; font-family: monospace; white-space: pre-wrap; word-wrap: break-word; }
+        .status-info { background: #34495e; color: white; padding: 15px; border-radius: 4px; margin-bottom: 20px; }
+        .debug-info { background: #7f8c8d; color: white; padding: 10px; border-radius: 4px; margin: 10px 0; font-size: 0.9em; }
+        .logs { background: #2c3e50; color: #ecf0f1; padding: 20px; border-radius: 4px; font-family: monospace; white-space: pre-wrap; word-wrap: break-word; min-height: 200px; }
         .btn { padding: 8px 16px; margin: 5px; border: none; border-radius: 4px; cursor: pointer; text-decoration: none; display: inline-block; }
         .btn-primary { background: #3498db; color: white; }
+        .btn-success { background: #27ae60; color: white; }
         .refresh-info { color: #7f8c8d; font-size: 0.9em; margin: 10px 0; }
+        .help-section { background: #ecf0f1; padding: 15px; border-radius: 4px; margin: 20px 0; border-left: 4px solid #3498db; }
+        .help-title { font-weight: bold; color: #2c3e50; margin-bottom: 10px; }
+        .cmd { background: #34495e; color: #ecf0f1; padding: 5px 8px; border-radius: 3px; font-family: monospace; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>📋 Logs for {{.Project}}</h1>
+            <p>Session Status: {{.SessionStatus}}</p>
             <p class="refresh-info">⚡ Auto-refreshes every 5 seconds</p>
             <a href="/" class="btn btn-primary">← Back to Dashboard</a>
+            <a href="/logs?project={{.Project}}" class="btn btn-success">🔄 Refresh Now</a>
         </div>
+        
+        <div class="debug-info">
+            <strong>🔧 For Hackers:</strong> {{.DebugInfo}}
+        </div>
+        
+        <div class="help-section">
+            <div class="help-title">💡 Understanding the Logs</div>
+            <p><strong>What you're seeing:</strong> Real-time output from your application running in a tmux session.</p>
+            <p><strong>Behind the scenes:</strong> Draheim uses <span class="cmd">tmux new-session -d -s {{.Project}}</span> to run your app in the background, then captures output with <span class="cmd">tmux capture-pane -t {{.Project}} -p</span></p>
+            <p><strong>Manual access:</strong> Connect directly via <span class="cmd">tmux attach -t {{.Project}}</span></p>
+        </div>
+        
         <div class="logs">{{.Output}}</div>
+        
+        <div class="help-section">
+            <div class="help-title">🛠️ Troubleshooting</div>
+            <p><strong>No logs visible?</strong> Your application might not write to stdout/stderr, or may be starting up.</p>
+            <p><strong>Session not found?</strong> The application may have crashed. Check the dashboard and try redeploying.</p>
+            <p><strong>Want more control?</strong> Use <span class="cmd">tmux attach -t {{.Project}}</span> to interact directly with your application.</p>
+        </div>
     </div>
 </body>
 </html>
 `
 
 	data := struct {
-		Project string
-		Output  string
+		Project       string
+		Output        string
+		SessionStatus string
+		DebugInfo     string
 	}{
-		Project: projectName,
-		Output:  strings.TrimSpace(string(output)),
+		Project:       projectName,
+		Output:        strings.TrimSpace(string(output)),
+		SessionStatus: sessionStatus,
+		DebugInfo:     debugInfo,
 	}
 
 	t, _ := template.New("logs").Parse(tmpl)
@@ -1042,6 +1129,9 @@ func secretsHandler(w http.ResponseWriter, r *http.Request) {
         .secret-form { background: #ecf0f1; padding: 20px; border-radius: 8px; margin: 10px 0; }
         .warning { background: #f39c12; color: white; padding: 15px; border-radius: 4px; margin: 10px 0; }
         .info { background: #3498db; color: white; padding: 15px; border-radius: 4px; margin: 10px 0; }
+        .help-section { background: #d5dbdb; padding: 15px; border-radius: 4px; margin: 10px 0; border-left: 4px solid #3498db; }
+        .help-title { font-weight: bold; color: #2c3e50; margin-bottom: 10px; font-size: 1.1em; }
+        code { background: #34495e; color: #ecf0f1; padding: 2px 6px; border-radius: 3px; font-family: monospace; font-size: 0.9em; }
     </style>
 </head>
 <body>
@@ -1054,15 +1144,23 @@ func secretsHandler(w http.ResponseWriter, r *http.Request) {
         </div>
 
         <div class="info">
-            <strong>ℹ️ How secrets work:</strong><br>
-            • Global secrets are available to all projects (no prefix)<br>
-            • Project-specific secrets use format: PROJECT_NAME_SECRET_KEY<br>
-            • All secrets are encrypted at rest using AES-256-GCM<br>
-            • Secrets are injected as environment variables when starting projects
+            <strong>🔧 For Hackers - How Secrets Work Under the Hood:</strong><br>
+            • Secrets stored encrypted in <code>~/.draheim/secrets.json</code> using AES-256-GCM<br>
+            • Encryption key stored in <code>~/.draheim/secrets.key</code> with 600 permissions<br>
+            • Global secrets: Available to all projects (e.g., <code>DATABASE_URL</code>)<br>
+            • Project-specific: Format <code>PROJECT_NAME_SECRET_KEY</code> (e.g., <code>MYAPP_API_KEY</code>)<br>
+            • Injection: Added to tmux session environment when starting projects<br>
+            • Security: Values never appear in logs, UI, or process lists
         </div>
 
         <div class="card">
-            <h2>Add New Secret</h2>
+            <h2>🔐 Add New Secret</h2>
+            <div class="help-section">
+                <div class="help-title">💡 Secret Types</div>
+                <p><strong>Global Secret:</strong> <code>DATABASE_URL</code> → Available to all projects</p>
+                <p><strong>Project-Specific:</strong> <code>MYAPP_DATABASE_URL</code> → Only available to 'myapp' project</p>
+                <p><strong>Behind the scenes:</strong> Draheim reads secrets at deployment time and injects them using <code>ENV_VAR=value tmux new-session</code></p>
+            </div>
             <div class="secret-form">
                 <form hx-post="/secrets/add" hx-target="#secrets-list" hx-swap="outerHTML">
                     <div class="form-group">
