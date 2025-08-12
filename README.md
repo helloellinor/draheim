@@ -15,6 +15,8 @@ A Go/HTMX application and dashboard for deployment and management of other Go ap
 - **Client/Server Architecture**: Separate client and server components
 - **Auto-complete Forms**: Path suggestions and form auto-completion
 - **Non-intrusive Updates**: HTMX-based polling that doesn't interfere with form filling
+- **Secrets Management**: Encrypted storage and management of sensitive environment variables
+- **Demo System**: Comprehensive demonstration applications and interactive demo script
 
 ## Requirements
 
@@ -24,6 +26,22 @@ A Go/HTMX application and dashboard for deployment and management of other Go ap
 - Linux/Unix environment
 
 ## Quick Start
+
+### Option 1: Interactive Demo
+Run the comprehensive demo to see all features:
+
+```bash
+./demo/demo.sh
+```
+
+This interactive script demonstrates:
+- Building and deploying applications
+- Client/server communication
+- Web interface features
+- Secrets management
+- Log viewing and monitoring
+
+### Option 2: Manual Setup
 
 1. **Build both server and client:**
    ```bash
@@ -48,6 +66,10 @@ A Go/HTMX application and dashboard for deployment and management of other Go ap
    
    # Update a Git-based project
    ./draheim-client -action=update -name=myapp
+   
+   # Manage secrets
+   ./draheim-client -action=secret-add -secret-key=DATABASE_URL -secret-value=postgres://... -secret-desc="Database connection"
+   ./draheim-client -action=secrets
    ```
 
 ## Usage
@@ -105,6 +127,39 @@ You can deploy applications directly from Git repositories:
 2. **Via Client**: Use the client with `-repo` and `-branch` parameters
 3. **Automatic Building**: The system will clone the repo, build the Go application, and start it
 4. **Updates**: Use the Update button or client command to pull latest changes and rebuild
+
+### Secrets Management
+
+Draheim includes a secure secrets management system for handling sensitive environment variables:
+
+#### Web Interface
+1. **Access**: Visit http://localhost:8080/secrets
+2. **Add Secrets**: Use the web form to add encrypted secrets
+3. **View Secrets**: See all configured secrets (values are hidden for security)
+4. **Delete Secrets**: Remove secrets you no longer need
+
+#### Command Line
+```bash
+# List all secrets
+./draheim-client -action=secrets
+
+# Add a global secret (available to all projects)
+./draheim-client -action=secret-add -secret-key=DATABASE_URL -secret-value="postgres://user:pass@host/db" -secret-desc="Database connection"
+
+# Add a project-specific secret (only for 'myapp' project)
+./draheim-client -action=secret-add -secret-key=MYAPP_API_KEY -secret-value="sk-123456" -secret-desc="API key for myapp"
+
+# Delete a secret
+./draheim-client -action=secret-delete -secret-key=DATABASE_URL
+```
+
+#### How Secrets Work
+- **Encryption**: All secrets are encrypted at rest using AES-256-GCM
+- **Environment Variables**: Secrets are automatically injected as environment variables when projects start
+- **Global vs Project-specific**: 
+  - Global secrets (no prefix) are available to all projects
+  - Project-specific secrets use format: `PROJECT_NAME_SECRET_KEY`
+- **Security**: Secret values are never displayed in the web interface or logs
 
 ### Project Structure
 

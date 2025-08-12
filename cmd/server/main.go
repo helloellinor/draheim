@@ -1,9 +1,14 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -17,11 +22,274 @@ import (
 
 // Config represents the server configuration
 type Config struct {
-	ServerPort    string   `json:"server_port"`
-	RepoBasePath  string   `json:"repo_base_path"`
-	AllowedHosts  []string `json:"allowed_hosts"`
-	SSHKeyPath    string   `json:"ssh_key_path"`
-	DefaultBranch string   `json:"default_branch"`
+	ServerPort     string   `json:"server_port"`
+	RepoBasePath   string   `json:"repo_base_path"`
+	AllowedHosts   []string `json:"allowed_hosts"`
+	SSHKeyPath     string   `json:"ssh_key_path"`
+	DefaultBranch  string   `json:"default_branch"`
+	SecretsKeyPath string   `json:"secrets_key_path"`
+}
+
+// Secret represents an encrypted secret
+type Secret struct {
+	Key         string `json:"key"`
+	Value       string `json:"value"` // This will be encrypted
+	Description string `json:"description"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
+}
+
+// SecretsManager handles encrypted secret storage
+type SecretsManager struct {
+	secretsFile string
+	keyFile     string
+	secrets     map[string]*Secret
+}
+
+// NewSecretsManager creates a new secrets manager
+func NewSecretsManager(keyPath string) *SecretsManager {
+	return &SecretsManager{
+		secretsFile: "draheim-secrets.json",
+		keyFile:     keyPath,
+		secrets:     make(map[string]*Secret),
+	}
+}
+
+// generateKey generates a 32-byte key for AES-256
+func (sm *SecretsManager) generateKey() ([]byte, error) {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+// getOrCreateKey gets existing key or creates a new one
+func (sm *SecretsManager) getOrCreateKey() ([]byte, error) {
+	if _, err := os.Stat(sm.keyFile); os.IsNotExist(err) {
+		// Generate new key
+		key, err := sm.generateKey()
+		if err != nil {
+			return nil, err
+		}
+		
+		// Save key to file (base64 encoded)
+		keyStr := base64.StdEncoding.EncodeToString(key)
+		if err := ioutil.WriteFile(sm.keyFile, []byte(keyStr), 0600); err != nil {
+			return nil, err
+		}
+		
+		log.Printf("Generated new encryption key at: %s", sm.keyFile)
+		return key, nil
+	}
+	
+	// Load existing key
+	keyData, err := ioutil.ReadFile(sm.keyFile)
+	if err != nil {
+		return nil, err
+	}
+	
+	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(keyData)))
+	if err != nil {
+		return nil, err
+	}
+	
+	return key, nil
+}
+
+// encrypt encrypts a string using AES-256-GCM
+func (sm *SecretsManager) encrypt(plaintext string) (string, error) {
+	key, err := sm.getOrCreateKey()
+	if err != nil {
+		return "", err
+	}
+	
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+	
+	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
+// decrypt decrypts a string using AES-256-GCM
+func (sm *SecretsManager) decrypt(encryptedText string) (string, error) {
+	key, err := sm.getOrCreateKey()
+	if err != nil {
+		return "", err
+	}
+	
+	ciphertext, err := base64.StdEncoding.DecodeString(encryptedText)
+	if err != nil {
+		return "", err
+	}
+	
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return "", fmt.Errorf("ciphertext too short")
+	}
+	
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", err
+	}
+	
+	return string(plaintext), nil
+}
+
+// LoadSecrets loads secrets from encrypted file
+func (sm *SecretsManager) LoadSecrets() error {
+	if _, err := os.Stat(sm.secretsFile); os.IsNotExist(err) {
+		// No secrets file exists yet
+		return nil
+	}
+	
+	data, err := ioutil.ReadFile(sm.secretsFile)
+	if err != nil {
+		return err
+	}
+	
+	var encryptedSecrets map[string]*Secret
+	if err := json.Unmarshal(data, &encryptedSecrets); err != nil {
+		return err
+	}
+	
+	// Decrypt secrets
+	sm.secrets = make(map[string]*Secret)
+	for key, secret := range encryptedSecrets {
+		decryptedValue, err := sm.decrypt(secret.Value)
+		if err != nil {
+			log.Printf("Warning: Could not decrypt secret %s: %v", key, err)
+			continue
+		}
+		
+		sm.secrets[key] = &Secret{
+			Key:         secret.Key,
+			Value:       decryptedValue,
+			Description: secret.Description,
+			CreatedAt:   secret.CreatedAt,
+			UpdatedAt:   secret.UpdatedAt,
+		}
+	}
+	
+	return nil
+}
+
+// SaveSecrets saves secrets to encrypted file
+func (sm *SecretsManager) SaveSecrets() error {
+	encryptedSecrets := make(map[string]*Secret)
+	
+	for key, secret := range sm.secrets {
+		encryptedValue, err := sm.encrypt(secret.Value)
+		if err != nil {
+			return err
+		}
+		
+		encryptedSecrets[key] = &Secret{
+			Key:         secret.Key,
+			Value:       encryptedValue,
+			Description: secret.Description,
+			CreatedAt:   secret.CreatedAt,
+			UpdatedAt:   secret.UpdatedAt,
+		}
+	}
+	
+	data, err := json.MarshalIndent(encryptedSecrets, "", "  ")
+	if err != nil {
+		return err
+	}
+	
+	return ioutil.WriteFile(sm.secretsFile, data, 0600)
+}
+
+// AddSecret adds a new secret
+func (sm *SecretsManager) AddSecret(key, value, description string) error {
+	now := time.Now().Format(time.RFC3339)
+	
+	sm.secrets[key] = &Secret{
+		Key:         key,
+		Value:       value,
+		Description: description,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	
+	return sm.SaveSecrets()
+}
+
+// GetSecret retrieves a secret value
+func (sm *SecretsManager) GetSecret(key string) (string, bool) {
+	secret, exists := sm.secrets[key]
+	if !exists {
+		return "", false
+	}
+	return secret.Value, true
+}
+
+// ListSecrets returns all secrets (without values for security)
+func (sm *SecretsManager) ListSecrets() map[string]*Secret {
+	result := make(map[string]*Secret)
+	for key, secret := range sm.secrets {
+		result[key] = &Secret{
+			Key:         secret.Key,
+			Value:       "[HIDDEN]",
+			Description: secret.Description,
+			CreatedAt:   secret.CreatedAt,
+			UpdatedAt:   secret.UpdatedAt,
+		}
+	}
+	return result
+}
+
+// DeleteSecret removes a secret
+func (sm *SecretsManager) DeleteSecret(key string) error {
+	delete(sm.secrets, key)
+	return sm.SaveSecrets()
+}
+
+// GetSecretsForProject returns environment variables for a project
+func (sm *SecretsManager) GetSecretsForProject(projectName string) []string {
+	var envVars []string
+	
+	// Add project-specific secrets (prefixed with PROJECT_NAME_)
+	prefix := strings.ToUpper(projectName) + "_"
+	for key, secret := range sm.secrets {
+		if strings.HasPrefix(strings.ToUpper(key), prefix) {
+			envKey := strings.TrimPrefix(strings.ToUpper(key), prefix)
+			envVars = append(envVars, fmt.Sprintf("%s=%s", envKey, secret.Value))
+		}
+	}
+	
+	// Add global secrets (no prefix)
+	for key, secret := range sm.secrets {
+		if !strings.Contains(key, "_") {
+			envVars = append(envVars, fmt.Sprintf("%s=%s", strings.ToUpper(key), secret.Value))
+		}
+	}
+	
+	return envVars
 }
 
 // LoadConfig loads configuration from file or creates default
@@ -38,11 +306,12 @@ func LoadConfig() *Config {
 	
 	// Create default config
 	config := &Config{
-		ServerPort:    ":8080",
-		RepoBasePath:  "/tmp/draheim-repos",
-		AllowedHosts:  []string{"github.com", "gitlab.com", "bitbucket.org"},
-		SSHKeyPath:    filepath.Join(os.Getenv("HOME"), ".ssh/id_rsa"),
-		DefaultBranch: "main",
+		ServerPort:     ":8080",
+		RepoBasePath:   "/tmp/draheim-repos",
+		AllowedHosts:   []string{"github.com", "gitlab.com", "bitbucket.org"},
+		SSHKeyPath:     filepath.Join(os.Getenv("HOME"), ".ssh/id_rsa"),
+		DefaultBranch:  "main",
+		SecretsKeyPath: "draheim-secrets.key",
 	}
 	
 	// Save default config
@@ -122,10 +391,18 @@ func (pm *ProjectManager) StartProjectWithGit(name, binaryPath, gitRepo, gitBran
 
 	// Create new tmux session and start the application
 	var tmuxCmd string
+	
+	// Get secrets for this project
+	secrets := secretsManager.GetSecretsForProject(name)
+	envPrefix := ""
+	if len(secrets) > 0 {
+		envPrefix = strings.Join(secrets, " ") + " "
+	}
+	
 	if gitRepo != "" {
-		tmuxCmd = fmt.Sprintf("cd %s && ./%s", workingDir, name)
+		tmuxCmd = fmt.Sprintf("cd %s && %s./%s", workingDir, envPrefix, name)
 	} else {
-		tmuxCmd = fmt.Sprintf("cd %s && ./%s", filepath.Dir(binaryPath), filepath.Base(binaryPath))
+		tmuxCmd = fmt.Sprintf("cd %s && %s./%s", filepath.Dir(binaryPath), envPrefix, filepath.Base(binaryPath))
 	}
 	
 	cmd = exec.Command("tmux", "new-session", "-d", "-s", name, tmuxCmd)
@@ -227,10 +504,19 @@ func (pm *ProjectManager) BuildProject(workingDir, binaryName string) error {
 
 var pm *ProjectManager
 var config *Config
+var secretsManager *SecretsManager
 
 func main() {
 	config = LoadConfig()
 	pm = NewProjectManager(config)
+	
+	// Initialize secrets manager
+	secretsManager = NewSecretsManager(config.SecretsKeyPath)
+	if err := secretsManager.LoadSecrets(); err != nil {
+		log.Printf("Warning: Could not load secrets: %v", err)
+	} else {
+		log.Printf("Secrets manager initialized")
+	}
 
 	// Serve static files
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static/"))))
@@ -243,10 +529,14 @@ func main() {
 	http.HandleFunc("/logs", logsHandler)
 	http.HandleFunc("/update", updateHandler)
 	http.HandleFunc("/config", configHandler)
+	http.HandleFunc("/secrets", secretsHandler)
+	http.HandleFunc("/secrets/add", addSecretHandler)
+	http.HandleFunc("/secrets/delete", deleteSecretHandler)
 
 	log.Printf("Dra heim dashboard starting on http://localhost%s", config.ServerPort)
 	log.Printf("Repository base path: %s", config.RepoBasePath)
 	log.Printf("SSH key path: %s", config.SSHKeyPath)
+	log.Printf("Secrets key path: %s", config.SecretsKeyPath)
 	log.Fatal(http.ListenAndServe(config.ServerPort, nil))
 }
 
@@ -690,6 +980,7 @@ func configHandler(w http.ResponseWriter, r *http.Request) {
             <h1>⚙️ Configuration</h1>
             <p>Server Configuration for Dra heim</p>
             <a href="/" class="btn btn-primary">← Back to Dashboard</a>
+            <a href="/secrets" class="btn btn-primary">🔐 Manage Secrets</a>
         </div>
         
         <div class="card">
@@ -702,6 +993,7 @@ func configHandler(w http.ResponseWriter, r *http.Request) {
             <p><strong>Server Port:</strong> {{.Config.ServerPort}}</p>
             <p><strong>Repository Base Path:</strong> {{.Config.RepoBasePath}}</p>
             <p><strong>SSH Key Path:</strong> {{.Config.SSHKeyPath}}</p>
+            <p><strong>Secrets Key Path:</strong> {{.Config.SecretsKeyPath}}</p>
             <p><strong>Default Branch:</strong> {{.Config.DefaultBranch}}</p>
             <p><strong>Allowed Hosts:</strong> {{range .Config.AllowedHosts}}{{.}} {{end}}</p>
         </div>
@@ -723,4 +1015,255 @@ func configHandler(w http.ResponseWriter, r *http.Request) {
 		t, _ := template.New("config").Parse(tmpl)
 		t.Execute(w, data)
 	}
+}
+
+func secretsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		tmpl := `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Secrets Management - Dra heim</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 1000px; margin: 0 auto; }
+        .header { background: #2c3e50; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .card { background: white; padding: 20px; margin: 10px 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .btn { padding: 8px 16px; margin: 5px; border: none; border-radius: 4px; cursor: pointer; text-decoration: none; display: inline-block; }
+        .btn-primary { background: #3498db; color: white; }
+        .btn-success { background: #27ae60; color: white; }
+        .btn-danger { background: #e74c3c; color: white; }
+        .form-group { margin: 15px 0; }
+        input, textarea { padding: 8px; margin: 5px; border: 1px solid #ddd; border-radius: 4px; width: 100%; box-sizing: border-box; }
+        table { width: 100%; border-collapse: collapse; margin: 10px 0; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #f8f9fa; }
+        .secret-form { background: #ecf0f1; padding: 20px; border-radius: 8px; margin: 10px 0; }
+        .warning { background: #f39c12; color: white; padding: 15px; border-radius: 4px; margin: 10px 0; }
+        .info { background: #3498db; color: white; padding: 15px; border-radius: 4px; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔐 Secrets Management</h1>
+            <p>Secure management of environment variables and sensitive data</p>
+            <a href="/" class="btn btn-primary">← Back to Dashboard</a>
+            <a href="/config" class="btn btn-primary">⚙️ Configuration</a>
+        </div>
+
+        <div class="info">
+            <strong>ℹ️ How secrets work:</strong><br>
+            • Global secrets are available to all projects (no prefix)<br>
+            • Project-specific secrets use format: PROJECT_NAME_SECRET_KEY<br>
+            • All secrets are encrypted at rest using AES-256-GCM<br>
+            • Secrets are injected as environment variables when starting projects
+        </div>
+
+        <div class="card">
+            <h2>Add New Secret</h2>
+            <div class="secret-form">
+                <form hx-post="/secrets/add" hx-target="#secrets-list" hx-swap="outerHTML">
+                    <div class="form-group">
+                        <label><strong>Secret Key:</strong></label>
+                        <input type="text" name="key" required placeholder="e.g., DATABASE_URL or MYAPP_API_KEY" autocomplete="off">
+                        <small>Use PROJECT_NAME_ prefix for project-specific secrets</small>
+                    </div>
+                    <div class="form-group">
+                        <label><strong>Secret Value:</strong></label>
+                        <input type="password" name="value" required placeholder="Sensitive data (will be encrypted)" autocomplete="off">
+                    </div>
+                    <div class="form-group">
+                        <label><strong>Description:</strong></label>
+                        <input type="text" name="description" placeholder="Optional description of this secret">
+                    </div>
+                    <button type="submit" class="btn btn-success">🔐 Add Secret</button>
+                </form>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Current Secrets</h2>
+            <div id="secrets-list">
+                {{template "secrets-table" .}}
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+
+{{define "secrets-table"}}
+<table>
+    <thead>
+        <tr>
+            <th>Key</th>
+            <th>Description</th>
+            <th>Created</th>
+            <th>Updated</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {{range $key, $secret := .}}
+        <tr>
+            <td><code>{{$secret.Key}}</code></td>
+            <td>{{$secret.Description}}</td>
+            <td>{{$secret.CreatedAt}}</td>
+            <td>{{$secret.UpdatedAt}}</td>
+            <td>
+                <button class="btn btn-danger" 
+                        hx-post="/secrets/delete" 
+                        hx-vals='{"key": "{{$secret.Key}}"}'
+                        hx-target="#secrets-list"
+                        hx-confirm="Are you sure you want to delete the secret '{{$secret.Key}}'?"
+                        hx-swap="outerHTML">Delete</button>
+            </td>
+        </tr>
+        {{end}}
+    </tbody>
+</table>
+{{if eq (len .) 0}}
+<p>No secrets configured yet. Add your first secret using the form above.</p>
+{{end}}
+{{end}}
+`
+		
+		secrets := secretsManager.ListSecrets()
+		t, _ := template.New("secrets").Parse(tmpl)
+		t.Execute(w, secrets)
+	}
+}
+
+func addSecretHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	key := r.FormValue("key")
+	value := r.FormValue("value")
+	description := r.FormValue("description")
+
+	if key == "" || value == "" {
+		http.Error(w, "Key and value are required", http.StatusBadRequest)
+		return
+	}
+
+	// Validate key format
+	if strings.ContainsAny(key, " \t\n\r") {
+		http.Error(w, "Secret key cannot contain whitespace", http.StatusBadRequest)
+		return
+	}
+
+	err := secretsManager.AddSecret(key, value, description)
+	if err != nil {
+		log.Printf("Error adding secret %s: %v", key, err)
+		http.Error(w, "Failed to add secret", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Added secret: %s", key)
+
+	// Return updated secrets table
+	tmpl := `
+<table>
+    <thead>
+        <tr>
+            <th>Key</th>
+            <th>Description</th>
+            <th>Created</th>
+            <th>Updated</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {{range $key, $secret := .}}
+        <tr>
+            <td><code>{{$secret.Key}}</code></td>
+            <td>{{$secret.Description}}</td>
+            <td>{{$secret.CreatedAt}}</td>
+            <td>{{$secret.UpdatedAt}}</td>
+            <td>
+                <button class="btn btn-danger" 
+                        hx-post="/secrets/delete" 
+                        hx-vals='{"key": "{{$secret.Key}}"}'
+                        hx-target="#secrets-list"
+                        hx-confirm="Are you sure you want to delete the secret '{{$secret.Key}}'?"
+                        hx-swap="outerHTML">Delete</button>
+            </td>
+        </tr>
+        {{end}}
+    </tbody>
+</table>
+{{if eq (len .) 0}}
+<p>No secrets configured yet. Add your first secret using the form above.</p>
+{{end}}
+`
+
+	secrets := secretsManager.ListSecrets()
+	t, _ := template.New("secrets-table").Parse(tmpl)
+	t.Execute(w, secrets)
+}
+
+func deleteSecretHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	key := r.FormValue("key")
+	if key == "" {
+		http.Error(w, "Key is required", http.StatusBadRequest)
+		return
+	}
+
+	err := secretsManager.DeleteSecret(key)
+	if err != nil {
+		log.Printf("Error deleting secret %s: %v", key, err)
+		http.Error(w, "Failed to delete secret", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Deleted secret: %s", key)
+
+	// Return updated secrets table
+	tmpl := `
+<table>
+    <thead>
+        <tr>
+            <th>Key</th>
+            <th>Description</th>
+            <th>Created</th>
+            <th>Updated</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {{range $key, $secret := .}}
+        <tr>
+            <td><code>{{$secret.Key}}</code></td>
+            <td>{{$secret.Description}}</td>
+            <td>{{$secret.CreatedAt}}</td>
+            <td>{{$secret.UpdatedAt}}</td>
+            <td>
+                <button class="btn btn-danger" 
+                        hx-post="/secrets/delete" 
+                        hx-vals='{"key": "{{$secret.Key}}"}'
+                        hx-target="#secrets-list"
+                        hx-confirm="Are you sure you want to delete the secret '{{$secret.Key}}'?"
+                        hx-swap="outerHTML">Delete</button>
+            </td>
+        </tr>
+        {{end}}
+    </tbody>
+</table>
+{{if eq (len .) 0}}
+<p>No secrets configured yet. Add your first secret using the form above.</p>
+{{end}}
+`
+
+	secrets := secretsManager.ListSecrets()
+	t, _ := template.New("secrets-table").Parse(tmpl)
+	t.Execute(w, secrets)
 }

@@ -38,5 +38,9 @@ temp/
 draheim-config.json
 draheim-client-config.json
 
+# Secrets files (contain encrypted sensitive data)
+draheim-secrets.json
+draheim-secrets.key
+
 # Repository directories
 /tmp/draheim-repos/

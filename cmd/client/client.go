@@ -57,13 +57,16 @@ func main() {
 	config := loadClientConfig()
 	
 	var (
-		action     = flag.String("action", "list", "Action to perform: list, deploy, stop, update, logs")
-		name       = flag.String("name", "", "Project name")
-		gitRepo    = flag.String("repo", "", "Git repository URL")
-		gitBranch  = flag.String("branch", "main", "Git branch")
-		port       = flag.Int("port", 8081, "Port number")
-		binaryPath = flag.String("path", "", "Binary path")
-		serverURL  = flag.String("server", config.ServerURL, "Server URL")
+		action       = flag.String("action", "list", "Action to perform: list, deploy, stop, update, logs, secrets, secret-add, secret-delete")
+		name         = flag.String("name", "", "Project name")
+		gitRepo      = flag.String("repo", "", "Git repository URL")
+		gitBranch    = flag.String("branch", "main", "Git branch")
+		port         = flag.Int("port", 8081, "Port number")
+		binaryPath   = flag.String("path", "", "Binary path")
+		serverURL    = flag.String("server", config.ServerURL, "Server URL")
+		secretKey    = flag.String("secret-key", "", "Secret key for secret operations")
+		secretValue  = flag.String("secret-value", "", "Secret value for adding secrets")
+		secretDesc   = flag.String("secret-desc", "", "Secret description")
 	)
 	flag.Parse()
 
@@ -92,9 +95,21 @@ func main() {
 			log.Fatal("Project name is required for logs action")
 		}
 		showLogs(config, *name)
+	case "secrets":
+		listSecrets(config)
+	case "secret-add":
+		if *secretKey == "" || *secretValue == "" {
+			log.Fatal("Secret key and value are required for secret-add action")
+		}
+		addSecret(config, *secretKey, *secretValue, *secretDesc)
+	case "secret-delete":
+		if *secretKey == "" {
+			log.Fatal("Secret key is required for secret-delete action")
+		}
+		deleteSecret(config, *secretKey)
 	default:
 		fmt.Printf("Unknown action: %s\n", *action)
-		fmt.Println("Available actions: list, deploy, stop, update, logs")
+		fmt.Println("Available actions: list, deploy, stop, update, logs, secrets, secret-add, secret-delete")
 		os.Exit(1)
 	}
 }
@@ -198,4 +213,91 @@ func showLogs(config *ClientConfig, name string) {
 	}
 	
 	fmt.Println("Could not extract logs from response")
+}
+
+func listSecrets(config *ClientConfig) {
+	resp, err := http.Get(config.ServerURL + "/secrets")
+	if err != nil {
+		log.Fatalf("Failed to connect to server: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatalf("Failed to read response: %v", err)
+	}
+
+	// Extract secrets table from HTML (simple approach)
+	content := string(body)
+	fmt.Println("Secrets on server:")
+	
+	// Look for table content
+	if strings.Contains(content, "No secrets configured") {
+		fmt.Println("No secrets configured yet.")
+		return
+	}
+	
+	// Parse table rows for basic info
+	lines := strings.Split(content, "\n")
+	fmt.Printf("%-20s %-30s %-20s\n", "KEY", "DESCRIPTION", "CREATED")
+	fmt.Println(strings.Repeat("-", 70))
+	
+	inTable := false
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "<tbody>") {
+			inTable = true
+			continue
+		}
+		if strings.Contains(line, "</tbody>") {
+			break
+		}
+		if inTable && strings.Contains(line, "<code>") {
+			// Extract key from <code> tags
+			start := strings.Index(line, "<code>") + 6
+			end := strings.Index(line[start:], "</code>")
+			if end > 0 {
+				key := line[start : start+end]
+				fmt.Printf("%-20s %-30s %-20s\n", key, "[Check web UI]", "[Check web UI]")
+			}
+		}
+	}
+}
+
+func addSecret(config *ClientConfig, key, value, description string) {
+	data := url.Values{}
+	data.Set("key", key)
+	data.Set("value", value)
+	data.Set("description", description)
+
+	resp, err := http.PostForm(config.ServerURL+"/secrets/add", data)
+	if err != nil {
+		log.Fatalf("Failed to add secret: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		fmt.Printf("Successfully added secret: %s\n", key)
+	} else {
+		body, _ := ioutil.ReadAll(resp.Body)
+		fmt.Printf("Failed to add secret: %s\n", string(body))
+	}
+}
+
+func deleteSecret(config *ClientConfig, key string) {
+	data := url.Values{}
+	data.Set("key", key)
+
+	resp, err := http.PostForm(config.ServerURL+"/secrets/delete", data)
+	if err != nil {
+		log.Fatalf("Failed to delete secret: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		fmt.Printf("Successfully deleted secret: %s\n", key)
+	} else {
+		body, _ := ioutil.ReadAll(resp.Body)
+		fmt.Printf("Failed to delete secret: %s\n", string(body))
+	}
 }
