@@ -6,7 +6,14 @@ import (
 )
 
 func TestProjectManager(t *testing.T) {
-	pm := NewProjectManager()
+	config := &Config{
+		ServerPort:    ":8080",
+		RepoBasePath:  "/tmp/test",
+		AllowedHosts:  []string{"github.com"},
+		SSHKeyPath:    "",
+		DefaultBranch: "main",
+	}
+	pm := NewProjectManager(config)
 	
 	// Test that new ProjectManager is empty
 	if len(pm.GetProjects()) != 0 {
@@ -21,6 +28,9 @@ func TestProjectCreation(t *testing.T) {
 		Port:        8080,
 		LastUpdated: time.Now(),
 		BinaryPath:  "/test/path",
+		GitRepo:     "",
+		GitBranch:   "main",
+		WorkingDir:  "/test/dir",
 	}
 	
 	if project.Name != "test" {

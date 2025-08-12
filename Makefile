@@ -1,18 +1,25 @@
 # Dra heim - Go Application Deployment Dashboard
 
-.PHONY: build run clean test
+.PHONY: build run clean test server client
 
-# Build the application
-build:
-	go build -o draheim main.go
+# Build both server and client
+build: server client
 
-# Run the application
-run: build
+# Build the server
+server:
+	go build -o draheim cmd/server/main.go
+
+# Build the client
+client:
+	go build -o draheim-client cmd/client/client.go
+
+# Run the server
+run: server
 	./draheim
 
 # Clean build artifacts
 clean:
-	rm -f draheim
+	rm -f draheim draheim-client draheim-config.json draheim-client-config.json
 
 # Test the application
 test:
@@ -28,7 +35,7 @@ dev:
 	air
 
 # Deploy to production (builds and starts with tmux)
-deploy: build
+deploy: server
 	tmux new-session -d -s draheim ./draheim || tmux send-keys -t draheim C-c './draheim' Enter
 
 # Stop the application
@@ -45,3 +52,19 @@ status:
 # Show logs
 logs:
 	tmux capture-pane -t draheim -p 2>/dev/null || echo "No draheim session found"
+
+# Client commands
+client-list: client
+	./draheim-client -action=list
+
+client-deploy: client
+	./draheim-client -action=deploy -name=$(NAME) -repo=$(REPO) -branch=$(BRANCH) -port=$(PORT)
+
+client-stop: client
+	./draheim-client -action=stop -name=$(NAME)
+
+client-update: client
+	./draheim-client -action=update -name=$(NAME)
+
+client-logs: client
+	./draheim-client -action=logs -name=$(NAME)

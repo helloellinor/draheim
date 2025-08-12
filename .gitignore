@@ -1,5 +1,6 @@
 # Build artifacts
 draheim
+draheim-client
 *.exe
 *.exe~
 *.dll
@@ -32,3 +33,10 @@ Thumbs.db
 # Temporary files
 tmp/
 temp/
+
+# Configuration files (may contain sensitive information)
+draheim-config.json
+draheim-client-config.json
+
+# Repository directories
+/tmp/draheim-repos/
