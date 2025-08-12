@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -50,7 +49,7 @@ func main() {
 	}
 
 	taskManager := NewTaskManager()
-	
+
 	// Add some demo tasks
 	taskManager.AddTask("1", "Deploy Hello World app")
 	taskManager.AddTask("2", "Set up Git repository")
@@ -101,6 +100,6 @@ func main() {
 	log.Printf("  GET /        - API info")
 	log.Printf("  GET /tasks   - Task list")
 	log.Printf("  GET /health  - Health check")
-	
+
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
