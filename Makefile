@@ -1,4 +1,4 @@
-# Dra heim - Go Application Deployment Dashboard
+¡# Dra heim - Go Application Deployment Dashboard
 
 .PHONY: build run clean test server client
 
@@ -68,25 +68,3 @@ client-update: client
 
 client-logs: client
 	./draheim-client -action=logs -name=$(NAME)
-
-# Secrets management commands
-client-secrets: client
-	./draheim-client -action=secrets
-
-client-secret-add: client
-	./draheim-client -action=secret-add -secret-key=$(KEY) -secret-value=$(VALUE) -secret-desc="$(DESC)"
-
-client-secret-delete: client
-	./draheim-client -action=secret-delete -secret-key=$(KEY)
-
-# Demo commands
-demo: build
-	./demo/demo.sh
-
-demo-quick: build
-	@echo "Quick demo setup..."
-	@echo "Starting server..."
-	@./draheim &
-	@sleep 3
-	@echo "Server running at http://localhost:8080"
-	@echo "Visit the web interface or run 'make demo' for full interactive demo"

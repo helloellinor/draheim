@@ -12,10 +12,13 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"crypto/subtle"
 	"strings"
 	"time"
 )
@@ -28,6 +31,10 @@ type Config struct {
 	SSHKeyPath     string   `json:"ssh_key_path"`
 	DefaultBranch  string   `json:"default_branch"`
 	SecretsKeyPath string   `json:"secrets_key_path"`
+	// APIKey gates every endpoint. Empty means the server refuses to
+	// start: an unauthenticated deploy endpoint on a shared host is a
+	// remote shell for anyone who can reach the port.
+	APIKey string `json:"api_key"`
 }
 
 // Secret represents an encrypted secret
@@ -292,6 +299,66 @@ func (sm *SecretsManager) GetSecretsForProject(projectName string) []string {
 	return envVars
 }
 
+// finnSSHNøkkel picks a key that actually exists. The default was
+// hardcoded to id_rsa, which many machines no longer have - ed25519 has
+// been the default for new keys for years - so private clones failed with
+// a confusing git error rather than a missing-file one.
+func finnSSHNøkkel() string {
+	heim := os.Getenv("HOME")
+	for _, n := range []string{"id_ed25519", "id_ecdsa", "id_rsa"} {
+		bane := filepath.Join(heim, ".ssh", n)
+		if _, err := os.Stat(bane); err == nil {
+			return bane
+		}
+	}
+	return filepath.Join(heim, ".ssh", "id_ed25519")
+}
+
+func nyNøkkel() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// reProjectName is deliberately strict. The project name reaches tmux,
+// the filesystem and (previously) a shell string, so anything outside
+// this set is rejected rather than escaped.
+var reProjectName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
+
+func validProjectName(name string) error {
+	if !reProjectName.MatchString(name) {
+		return fmt.Errorf("invalid project name %q: use letters, digits, dot, dash, underscore (max 64)", name)
+	}
+	return nil
+}
+
+// hostAllowed enforces AllowedHosts, which until now was declared,
+// displayed on the config page, and never actually checked.
+func (pm *ProjectManager) hostAllowed(repoURL string) error {
+	if len(pm.config.AllowedHosts) == 0 {
+		return fmt.Errorf("no allowed_hosts configured; refusing to clone %q", repoURL)
+	}
+	host := ""
+	if u, err := url.Parse(repoURL); err == nil && u.Host != "" {
+		host = u.Hostname()
+	} else if i := strings.Index(repoURL, "@"); i >= 0 {
+		// scp-form: git@github.com:user/repo.git
+		rest := repoURL[i+1:]
+		host = strings.SplitN(rest, ":", 2)[0]
+	}
+	if host == "" {
+		return fmt.Errorf("could not determine host from %q", repoURL)
+	}
+	for _, a := range pm.config.AllowedHosts {
+		if strings.EqualFold(host, a) {
+			return nil
+		}
+	}
+	return fmt.Errorf("host %q is not in allowed_hosts", host)
+}
+
 // LoadConfig loads configuration from file or creates default
 func LoadConfig() *Config {
 	configPath := "draheim-config.json"
@@ -304,19 +371,28 @@ func LoadConfig() *Config {
 		}
 	}
 	
-	// Create default config
+	// Create default config.
+	//
+	// Bound to loopback, not ":8080". The dashboard can deploy and run
+	// arbitrary code, so it has no business listening on every interface of
+	// a shared host by default; reach it over an SSH tunnel, or set the
+	// address deliberately.
+	//
+	// A fresh key is generated rather than left blank, so a new install is
+	// never briefly open while someone gets around to filling it in.
 	config := &Config{
-		ServerPort:     ":8080",
+		ServerPort:     "127.0.0.1:8080",
 		RepoBasePath:   "/tmp/draheim-repos",
 		AllowedHosts:   []string{"github.com", "gitlab.com", "bitbucket.org"},
-		SSHKeyPath:     filepath.Join(os.Getenv("HOME"), ".ssh/id_rsa"),
+		SSHKeyPath:     finnSSHNøkkel(),
 		DefaultBranch:  "main",
 		SecretsKeyPath: "draheim-secrets.key",
+		APIKey:         nyNøkkel(),
 	}
 	
-	// Save default config
+	// Save default config. 0600: it holds the API key.
 	if data, err := json.MarshalIndent(config, "", "  "); err == nil {
-		ioutil.WriteFile(configPath, data, 0644)
+		ioutil.WriteFile(configPath, data, 0600)
 	}
 	
 	return config
@@ -334,6 +410,7 @@ type Project struct {
 	GitRepo     string
 	GitBranch   string
 	WorkingDir  string
+	BuildPath   string
 }
 
 // ProjectManager handles deployment and management of Go applications
@@ -354,10 +431,13 @@ func (pm *ProjectManager) GetProjects() map[string]*Project {
 }
 
 func (pm *ProjectManager) StartProject(name, binaryPath string, port int) error {
-	return pm.StartProjectWithGit(name, binaryPath, "", "", port)
+	return pm.StartProjectWithGit(name, binaryPath, "", "", "", port)
 }
 
-func (pm *ProjectManager) StartProjectWithGit(name, binaryPath, gitRepo, gitBranch string, port int) error {
+func (pm *ProjectManager) StartProjectWithGit(name, binaryPath, gitRepo, gitBranch, buildPath string, port int) error {
+	if err := validProjectName(name); err != nil {
+		return err
+	}
 	// Check if tmux session exists
 	cmd := exec.Command("tmux", "has-session", "-t", name)
 	if err := cmd.Run(); err == nil {
@@ -382,32 +462,38 @@ func (pm *ProjectManager) StartProjectWithGit(name, binaryPath, gitRepo, gitBran
 		
 		// Build the project
 		binaryName := name
-		if err := pm.BuildProject(workingDir, binaryName); err != nil {
+		if err := pm.BuildProject(workingDir, binaryName, buildPath); err != nil {
 			return err
 		}
 		
 		binaryPath = filepath.Join(workingDir, binaryName)
 	}
 
-	// Create new tmux session and start the application
-	var tmuxCmd string
-	
-	// Get secrets for this project
-	secrets := secretsManager.GetSecretsForProject(name)
-	envPrefix := ""
-	if len(secrets) > 0 {
-		envPrefix = strings.Join(secrets, " ") + " "
+	// Start the application in its own tmux session.
+	//
+	// The command is passed as argv, not as a shell string. It used to be
+	// built with fmt.Sprintf and handed to tmux to interpret, so a project
+	// name containing ';' ran whatever followed it - and every secret value
+	// was spliced in unquoted, which both broke on spaces and injected.
+	//
+	// Secrets go through the environment (tmux -e) instead of the command
+	// line, so they no longer show up in `ps` for every user on the host.
+	runDir := workingDir
+	binary := name
+	if gitRepo == "" {
+		runDir = filepath.Dir(binaryPath)
+		binary = filepath.Base(binaryPath)
 	}
-	
-	if gitRepo != "" {
-		tmuxCmd = fmt.Sprintf("cd %s && %s./%s", workingDir, envPrefix, name)
-	} else {
-		tmuxCmd = fmt.Sprintf("cd %s && %s./%s", filepath.Dir(binaryPath), envPrefix, filepath.Base(binaryPath))
+
+	args := []string{"new-session", "-d", "-s", name, "-c", runDir}
+	for _, kv := range secretsManager.GetSecretsForProject(name) {
+		args = append(args, "-e", kv)
 	}
-	
-	cmd = exec.Command("tmux", "new-session", "-d", "-s", name, tmuxCmd)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to start project %s: %v", name, err)
+	args = append(args, "./"+binary)
+
+	cmd = exec.Command("tmux", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to start project %s: %v: %s", name, err, strings.TrimSpace(string(out)))
 	}
 
 	// Add to projects map
@@ -421,12 +507,16 @@ func (pm *ProjectManager) StartProjectWithGit(name, binaryPath, gitRepo, gitBran
 		GitRepo:     gitRepo,
 		GitBranch:   gitBranch,
 		WorkingDir:  workingDir,
+		BuildPath:   buildPath,
 	}
 
 	return nil
 }
 
 func (pm *ProjectManager) StopProject(name string) error {
+	if err := validProjectName(name); err != nil {
+		return err
+	}
 	cmd := exec.Command("tmux", "kill-session", "-t", name)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to stop project %s: %v", name, err)
@@ -450,6 +540,9 @@ func (pm *ProjectManager) GetProjectStatus(name string) (string, error) {
 
 // CloneOrUpdateRepo clones a repository or pulls updates if it already exists
 func (pm *ProjectManager) CloneOrUpdateRepo(repoURL, workingDir, branch string) error {
+	if err := pm.hostAllowed(repoURL); err != nil {
+		return err
+	}
 	// Ensure base directory exists
 	if err := os.MkdirAll(pm.config.RepoBasePath, 0755); err != nil {
 		return fmt.Errorf("failed to create repo base path: %v", err)
@@ -492,9 +585,18 @@ func (pm *ProjectManager) CloneOrUpdateRepo(repoURL, workingDir, branch string) 
 }
 
 // BuildProject builds a Go project in the working directory
-func (pm *ProjectManager) BuildProject(workingDir, binaryName string) error {
-	log.Printf("Building project in %s", workingDir)
-	cmd := exec.Command("go", "build", "-o", binaryName, ".")
+// BuildProject builds the package at buildPath relative to the repo root.
+// It used to hardcode ".", which fails for every repo whose main package
+// lives in a subdirectory - the common Go layout, e.g. ./cmd/server.
+func (pm *ProjectManager) BuildProject(workingDir, binaryName, buildPath string) error {
+	if buildPath == "" {
+		buildPath = "."
+	}
+	if filepath.IsAbs(buildPath) || strings.Contains(buildPath, "..") {
+		return fmt.Errorf("invalid build path %q: must be relative and inside the repo", buildPath)
+	}
+	log.Printf("Building %s in %s", buildPath, workingDir)
+	cmd := exec.Command("go", "build", "-o", binaryName, "./"+filepath.ToSlash(filepath.Clean(buildPath)))
 	cmd.Dir = workingDir
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to build project: %v", err)
@@ -506,8 +608,42 @@ var pm *ProjectManager
 var config *Config
 var secretsManager *SecretsManager
 
+// krev wraps a handler so it only runs for a caller that presents the
+// API key, either as "Authorization: Bearer <key>" or the draheim_key
+// cookie (so the dashboard works in a browser after one login).
+//
+// subtle.ConstantTimeCompare, not ==: string comparison returns early on
+// the first differing byte, which leaks the key one byte at a time to
+// anyone willing to time the responses.
+func krev(neste http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		gitt := ""
+		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			gitt = strings.TrimPrefix(h, "Bearer ")
+		} else if c, err := r.Cookie("draheim_key"); err == nil {
+			gitt = c.Value
+		} else if q := r.URL.Query().Get("key"); q != "" {
+			gitt = q
+		}
+		if subtle.ConstantTimeCompare([]byte(gitt), []byte(config.APIKey)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="draheim"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Query().Get("key") != "" {
+			http.SetCookie(w, &http.Cookie{Name: "draheim_key", Value: gitt,
+				Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
+		}
+		neste(w, r)
+	}
+}
+
 func main() {
 	config = LoadConfig()
+	if config.APIKey == "" {
+		log.Fatal("api_key is empty in draheim-config.json - refusing to start. " +
+			"Generate one with:  openssl rand -hex 32")
+	}
 	pm = NewProjectManager(config)
 	
 	// Initialize secrets manager
@@ -521,17 +657,20 @@ func main() {
 	// Serve static files
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static/"))))
 
-	// Routes
-	http.HandleFunc("/", dashboardHandler)
-	http.HandleFunc("/projects", projectsHandler)
-	http.HandleFunc("/deploy", deployHandler)
-	http.HandleFunc("/stop", stopHandler)
-	http.HandleFunc("/logs", logsHandler)
-	http.HandleFunc("/update", updateHandler)
-	http.HandleFunc("/config", configHandler)
-	http.HandleFunc("/secrets", secretsHandler)
-	http.HandleFunc("/secrets/add", addSecretHandler)
-	http.HandleFunc("/secrets/delete", deleteSecretHandler)
+	// Routes. Every one of them is behind krev(): the client config has
+	// carried an api_key since the beginning, but nothing ever sent it and
+	// nothing ever checked it, so /deploy would clone and run any repo for
+	// anyone who could reach the port.
+	http.HandleFunc("/", krev(dashboardHandler))
+	http.HandleFunc("/projects", krev(projectsHandler))
+	http.HandleFunc("/deploy", krev(deployHandler))
+	http.HandleFunc("/stop", krev(stopHandler))
+	http.HandleFunc("/logs", krev(logsHandler))
+	http.HandleFunc("/update", krev(updateHandler))
+	http.HandleFunc("/config", krev(configHandler))
+	http.HandleFunc("/secrets", krev(secretsHandler))
+	http.HandleFunc("/secrets/add", krev(addSecretHandler))
+	http.HandleFunc("/secrets/delete", krev(deleteSecretHandler))
 
 	log.Printf("Dra heim dashboard starting on http://localhost%s", config.ServerPort)
 	log.Printf("Repository base path: %s", config.RepoBasePath)
@@ -601,6 +740,10 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
                     <div class="form-group">
                         <label>Git Branch (default: main):</label>
                         <input type="text" name="git_branch" placeholder="main" value="main">
+                    </div>
+                    <div class="form-group">
+                        <label>Build path (default: repo root):</label>
+                        <input type="text" name="build_path" placeholder="cmd/server">
                     </div>
                     <div class="form-group">
                         <label>Port:</label>
@@ -767,11 +910,12 @@ func deployHandler(w http.ResponseWriter, r *http.Request) {
 	path := r.FormValue("path")
 	gitRepo := r.FormValue("git_repo")
 	gitBranch := r.FormValue("git_branch")
+	buildPath := r.FormValue("build_path")
 	portStr := r.FormValue("port")
 	restart := r.FormValue("restart") == "true"
 
-	if name == "" {
-		http.Error(w, "Project name is required", http.StatusBadRequest)
+	if err := validProjectName(name); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -795,6 +939,7 @@ func deployHandler(w http.ResponseWriter, r *http.Request) {
 			port = existingProject.Port
 			gitRepo = existingProject.GitRepo
 			gitBranch = existingProject.GitBranch
+			buildPath = existingProject.BuildPath
 		} else {
 			http.Error(w, "Project not found for restart", http.StatusBadRequest)
 			return
@@ -808,7 +953,7 @@ func deployHandler(w http.ResponseWriter, r *http.Request) {
 
 	var err error
 	if gitRepo != "" {
-		err = pm.StartProjectWithGit(name, path, gitRepo, gitBranch, port)
+		err = pm.StartProjectWithGit(name, path, gitRepo, gitBranch, buildPath, port)
 	} else {
 		err = pm.StartProject(name, path, port)
 	}
@@ -938,14 +1083,14 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Rebuild the project
-	if err := pm.BuildProject(project.WorkingDir, name); err != nil {
+	if err := pm.BuildProject(project.WorkingDir, name, project.BuildPath); err != nil {
 		log.Printf("Error building project %s: %v", name, err)
 		http.Error(w, fmt.Sprintf("Failed to build project: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	// Restart the project
-	if err := pm.StartProjectWithGit(name, project.BinaryPath, project.GitRepo, project.GitBranch, project.Port); err != nil {
+	if err := pm.StartProjectWithGit(name, project.BinaryPath, project.GitRepo, project.GitBranch, project.BuildPath, project.Port); err != nil {
 		log.Printf("Error restarting project %s after update: %v", name, err)
 		http.Error(w, fmt.Sprintf("Failed to restart project: %v", err), http.StatusInternalServerError)
 		return

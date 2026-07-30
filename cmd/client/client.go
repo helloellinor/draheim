@@ -61,6 +61,7 @@ func main() {
 		name         = flag.String("name", "", "Project name")
 		gitRepo      = flag.String("repo", "", "Git repository URL")
 		gitBranch    = flag.String("branch", "main", "Git branch")
+		buildPath    = flag.String("build-path", "", "sti til main-pakken i repoet, t.d. cmd/tenar")
 		port         = flag.Int("port", 8081, "Port number")
 		binaryPath   = flag.String("path", "", "Binary path")
 		serverURL    = flag.String("server", config.ServerURL, "Server URL")
@@ -79,7 +80,7 @@ func main() {
 		if *name == "" {
 			log.Fatal("Project name is required for deploy action")
 		}
-		deployProject(config, *name, *binaryPath, *gitRepo, *gitBranch, *port)
+		deployProject(config, *name, *binaryPath, *gitRepo, *gitBranch, *buildPath, *port)
 	case "stop":
 		if *name == "" {
 			log.Fatal("Project name is required for stop action")
@@ -114,8 +115,31 @@ func main() {
 	}
 }
 
+// hent og send legg API-nøkkelen paa kvar førespurnad. Klienten har hatt
+// api_key i konfigurasjonen sin heile tida, men sende han aldri - og
+// tenaren las han aldri - so alt stod ope for kven som helst som naadde
+// porten. Utan nøkkel svarar tenaren no 401.
+func hent(config *ClientConfig, sti string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", config.ServerURL+sti, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+config.APIKey)
+	return http.DefaultClient.Do(req)
+}
+
+func send(config *ClientConfig, sti string, data url.Values) (*http.Response, error) {
+	req, err := http.NewRequest("POST", config.ServerURL+sti, strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Authorization", "Bearer "+config.APIKey)
+	return http.DefaultClient.Do(req)
+}
+
 func listProjects(config *ClientConfig) {
-	resp, err := http.Get(config.ServerURL + "/projects")
+	resp, err := hent(config, "/projects")
 	if err != nil {
 		log.Fatalf("Failed to connect to server: %v", err)
 	}
@@ -130,15 +154,16 @@ func listProjects(config *ClientConfig) {
 	fmt.Println(string(body))
 }
 
-func deployProject(config *ClientConfig, name, binaryPath, gitRepo, gitBranch string, port int) {
+func deployProject(config *ClientConfig, name, binaryPath, gitRepo, gitBranch, buildPath string, port int) {
 	data := url.Values{}
 	data.Set("name", name)
 	data.Set("path", binaryPath)
 	data.Set("git_repo", gitRepo)
+	data.Set("build_path", buildPath)
 	data.Set("git_branch", gitBranch)
 	data.Set("port", fmt.Sprintf("%d", port))
 
-	resp, err := http.PostForm(config.ServerURL+"/deploy", data)
+	resp, err := send(config, "/deploy", data)
 	if err != nil {
 		log.Fatalf("Failed to deploy project: %v", err)
 	}
@@ -156,7 +181,7 @@ func stopProject(config *ClientConfig, name string) {
 	data := url.Values{}
 	data.Set("name", name)
 
-	resp, err := http.PostForm(config.ServerURL+"/stop", data)
+	resp, err := send(config, "/stop", data)
 	if err != nil {
 		log.Fatalf("Failed to stop project: %v", err)
 	}
@@ -174,7 +199,7 @@ func updateProject(config *ClientConfig, name string) {
 	data := url.Values{}
 	data.Set("name", name)
 
-	resp, err := http.PostForm(config.ServerURL+"/update", data)
+	resp, err := send(config, "/update", data)
 	if err != nil {
 		log.Fatalf("Failed to update project: %v", err)
 	}
@@ -189,7 +214,7 @@ func updateProject(config *ClientConfig, name string) {
 }
 
 func showLogs(config *ClientConfig, name string) {
-	resp, err := http.Get(config.ServerURL + "/logs?project=" + name)
+	resp, err := hent(config, "/logs?project="+name)
 	if err != nil {
 		log.Fatalf("Failed to get logs: %v", err)
 	}
@@ -216,7 +241,7 @@ func showLogs(config *ClientConfig, name string) {
 }
 
 func listSecrets(config *ClientConfig) {
-	resp, err := http.Get(config.ServerURL + "/secrets")
+	resp, err := hent(config, "/secrets")
 	if err != nil {
 		log.Fatalf("Failed to connect to server: %v", err)
 	}
@@ -270,7 +295,7 @@ func addSecret(config *ClientConfig, key, value, description string) {
 	data.Set("value", value)
 	data.Set("description", description)
 
-	resp, err := http.PostForm(config.ServerURL+"/secrets/add", data)
+	resp, err := send(config, "/secrets/add", data)
 	if err != nil {
 		log.Fatalf("Failed to add secret: %v", err)
 	}
@@ -288,7 +313,7 @@ func deleteSecret(config *ClientConfig, key string) {
 	data := url.Values{}
 	data.Set("key", key)
 
-	resp, err := http.PostForm(config.ServerURL+"/secrets/delete", data)
+	resp, err := send(config, "/secrets/delete", data)
 	if err != nil {
 		log.Fatalf("Failed to delete secret: %v", err)
 	}

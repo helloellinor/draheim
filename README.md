@@ -125,7 +125,7 @@ You can deploy applications directly from Git repositories:
 
 1. **Via Web Interface**: Fill in the Git Repository URL and branch in the deployment form
 2. **Via Client**: Use the client with `-repo` and `-branch` parameters
-3. **Automatic Building**: The system will clone the repo, build the Go application, and start it
+3. **Automatic Building**: The system will clone the repo, build the Go application, and start it. Use `build_path` / `-build-path` when the main package is not at the repo root (e.g. `cmd/server`) — the build used to assume the root and failed on the common Go layout.
 4. **Updates**: Use the Update button or client command to pull latest changes and rebuild
 
 ### Secrets Management
@@ -186,19 +186,51 @@ draheim/
 - **Configuration**: JSON-based configuration with sensible defaults
 - **Client/Server**: Separate client application for remote management
 
+## Security
+
+Every endpoint requires the API key. Pass it as `Authorization: Bearer <key>`,
+or visit the dashboard once as `http://host:8080/?key=<key>` — the key is then
+stored in an HttpOnly cookie for the session.
+
+The server **refuses to start with an empty `api_key`**. A fresh install
+generates one; to make your own:
+
+```bash
+openssl rand -hex 32
+```
+
+Defaults chosen deliberately:
+
+- **`server_port` binds to `127.0.0.1`**, not every interface. This service can
+  clone and execute arbitrary code, so reach it over an SSH tunnel
+  (`ssh -L 8080:localhost:8080 heim`) rather than exposing it on a shared host.
+- **`allowed_hosts` is enforced** on every clone. An empty list rejects
+  everything rather than allowing everything.
+- **Project names** are restricted to `[a-zA-Z0-9._-]`. The name reaches tmux
+  and the filesystem, so it is validated rather than escaped.
+- **Secrets are passed via `tmux -e`**, not spliced into a shell command, so
+  they no longer appear in `ps` output for other users on the host.
+- `draheim-config.json` is written `0600` because it holds the key.
+
 ## Configuration
 
 The server uses a JSON configuration file (`draheim-config.json`) with the following options:
 
 ```json
 {
-  "server_port": ":8080",
+  "server_port": "127.0.0.1:8080",
   "repo_base_path": "/tmp/draheim-repos",
   "allowed_hosts": ["github.com", "gitlab.com", "bitbucket.org"],
-  "ssh_key_path": "/home/user/.ssh/id_rsa", 
-  "default_branch": "main"
+  "ssh_key_path": "/home/user/.ssh/id_ed25519",
+  "default_branch": "main",
+  "secrets_key_path": "draheim-secrets.key",
+  "api_key": "generate-me"
 }
 ```
+
+`ssh_key_path` defaults to whichever of `id_ed25519`, `id_ecdsa`, `id_rsa`
+actually exists — it used to be hardcoded to `id_rsa`, which many machines no
+longer have.
 
 The client uses a separate configuration file (`draheim-client-config.json`):
 
